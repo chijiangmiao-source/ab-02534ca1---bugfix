@@ -3,7 +3,8 @@
  * 覆盖：
  *   1. 吸收律场景的最小割集；
  *   2. 共享子门的事件归属；
- *   3. 任一门规范化后超过 2000 个割集的超限场景。
+ *   3. 任一门规范化后超过 2000 个割集的超限场景；
+ *   4. 双环一次定位（数量/闭合见证/行号）、仅修复一环、换序不漏报与菱形 DAG 不误报。
  * 任一断言失败即以非零退出码结束进程。
  */
 import { analyze } from '../src/core/engine';
@@ -94,6 +95,82 @@ console.log('[scenario 3] complexity_limit at 3^7=2187 > 2000');
   ln2.push('BIG AND GRP0 GRP1 GRP2 GRP3');
   const r2 = analyze(buildModel(ev2, ln2, 'BIG'));
   check('恰好 2000 时完整输出 2000 个割集', r2.status === 'complete' && r2.cutsets.length === 2000, r2.status);
+}
+
+// ---- 场景 4：双环一次性定位 ----
+// 上游 A1↔A2 与下游 B1↔B2 是两个独立 SCC，且 A2 单向引用 B1；
+// 无向连通的近似会把二者误并为一个分量而漏报下游环。
+console.log('[scenario 4] two independent cycles reported in one audit');
+{
+  const events = 'PWR_A\nPWR_B\n';
+  const gates =
+    'A1 OR PWR_A A2\n' +
+    'A2 AND A1 B1\n' +
+    'B1 OR PWR_A B2\n' +
+    'B2 AND B1 PWR_B\n';
+
+  const witness = (message: string): string[] =>
+    message.split('：')[1].split('（')[0].trim().split(' → ').map((s) => s.trim());
+  const closedByRealEdges = (path: string[], defs: Record<string, string[]>): boolean => {
+    if (path.length < 3 || path[0] !== path[path.length - 1]) return false;
+    if (new Set(path.slice(0, -1)).size !== path.length - 1) return false;
+    return path.slice(0, -1).every((from, i) => (defs[from] ?? []).includes(path[i + 1]));
+  };
+  const gateDefs: Record<string, string[]> = {};
+  gates.split('\n').filter(Boolean).forEach((line) => {
+    const [name, , ...inputs] = line.trim().split(/\s+/);
+    gateDefs[name] = inputs;
+  });
+
+  const r = audit(events, gates, 'A1');
+  check('状态为 invalid', r.status === 'invalid', r.status);
+  if (r.status === 'invalid') {
+    const cycles = r.issues.filter((i) => i.code === 'cycle');
+    check('恰有两个 cycle', cycles.length === 2, cycles.map((c) => c.message));
+    check('定位行号为第 1、3 行', JSON.stringify(cycles.map((c) => c.location.line)) === JSON.stringify([1, 3]));
+    check('定位门为 A1、B1', JSON.stringify(cycles.map((c) => c.location.token)) === JSON.stringify(['A1', 'B1']));
+    const w0 = witness(cycles[0].message);
+    const w1 = witness(cycles[1].message);
+    check('见证 1 为 A1→A2→A1', JSON.stringify(w0) === JSON.stringify(['A1', 'A2', 'A1']), w0);
+    check('见证 2 为 B1→B2→B1', JSON.stringify(w1) === JSON.stringify(['B1', 'B2', 'B1']), w1);
+    check('见证 1 沿真实引用闭合', closedByRealEdges(w0, gateDefs), w0);
+    check('见证 2 沿真实引用闭合', closedByRealEdges(w1, gateDefs), w1);
+  }
+
+  // 仅修复上游环：下游环必须单独保留
+  const fixedUp =
+    'A1 OR PWR_A A2\n' +
+    'A2 AND PWR_B B1\n' +
+    'B1 OR PWR_A B2\n' +
+    'B2 AND B1 PWR_B\n';
+  const r2 = audit(events, fixedUp, 'A1');
+  check('仅修复一环后仍 invalid', r2.status === 'invalid', r2.status);
+  if (r2.status === 'invalid') {
+    const cycles2 = r2.issues.filter((i) => i.code === 'cycle');
+    check('仅剩下游一个 cycle', cycles2.length === 1 && cycles2[0].location.token === 'B1', cycles2);
+  }
+
+  // 两环均修复：才允许进入割集分析
+  const fixedBoth =
+    'A1 OR PWR_A A2\n' +
+    'A2 AND PWR_B B1\n' +
+    'B1 OR PWR_A B2\n' +
+    'B2 AND PWR_A PWR_B\n';
+  const r3 = audit(events, fixedBoth, 'A1');
+  check('两环修复后 complete 且割集为 {PWR_A}', r3.status === 'complete' && JSON.stringify(names(r3.status === 'complete' ? r3.cutsets : [])) === JSON.stringify(['PWR_A']), r3.status);
+
+  // 门定义换序：两个环都不得遗漏
+  const reordered =
+    'B2 AND B1 PWR_B\n' +
+    'B1 OR PWR_A B2\n' +
+    'A2 AND A1 B1\n' +
+    'A1 OR PWR_A A2\n';
+  const r4 = audit(events, reordered, 'A1');
+  check('换序后仍报告两个 cycle', r4.status === 'invalid' && r4.issues.filter((i) => i.code === 'cycle').length === 2, r4.status);
+
+  // 共享菱形 DAG 合法、不被误报
+  const r5 = audit('A\nB\n', 'S OR A B\nL AND S A\nR AND S B\nT OR L R\n', 'T');
+  check('菱形 DAG 合法且割集为 {A},{B}', r5.status === 'complete' && JSON.stringify(names(r5.status === 'complete' ? r5.cutsets : [])) === JSON.stringify(['A', 'B']), r5.status);
 }
 
 if (failures > 0) {

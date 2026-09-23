@@ -83,58 +83,57 @@ function gateLine(model: ParsedModel, name: string): number | undefined {
 }
 
 /**
- * Tarjan 强连通分量。门数量上限 80，递归安全。
- * 返回每个非平凡 SCC 内的一条具体环路径（用于定位，任意长度均可）。
+ * Tarjan 强连通分量（有向）。门数量上限 80，递归安全。
+ * 彼此独立的环属于不同 SCC，必须分别报告；每个非平凡 SCC 返回一条
+ * 由真实引用组成且闭合的具体环路径（任意长度均可）。
+ *
+ * 注意不能用“忽略方向的连通块”近似 SCC：上游环单向引用下游环时
+ * （A2 → B1），无向连通会把两个独立环合并成一个分量，漏报下游环。
  */
 export function findCycles(adjacency: Map<string, string[]>): string[][] {
-  const remaining = new Set(adjacency.keys());
-  const incoming = new Map<string, Set<string>>();
-  const outgoing = new Map<string, Set<string>>();
-
-  for (const name of remaining) {
-    incoming.set(name, new Set());
-    outgoing.set(name, new Set());
-  }
-  for (const [from, targets] of adjacency) {
-    for (const to of targets) {
-      if (!remaining.has(to)) continue;
-      outgoing.get(from)!.add(to);
-      incoming.get(to)!.add(from);
-    }
-  }
-
-  const queue = [...remaining].filter(
-    (name) => incoming.get(name)!.size === 0 || outgoing.get(name)!.size === 0
-  );
-  while (queue.length > 0) {
-    const name = queue.pop()!;
-    if (!remaining.delete(name)) continue;
-    for (const parent of incoming.get(name)!) {
-      outgoing.get(parent)!.delete(name);
-      if (remaining.has(parent) && outgoing.get(parent)!.size === 0) queue.push(parent);
-    }
-    for (const child of outgoing.get(name)!) {
-      incoming.get(child)!.delete(name);
-      if (remaining.has(child) && incoming.get(child)!.size === 0) queue.push(child);
-    }
-  }
-
+  let nextIndex = 0;
+  const indices = new Map<string, number>();
+  const lowlinks = new Map<string, number>();
+  const onStack = new Set<string>();
+  const tarjanStack: string[] = [];
   const components: Set<string>[] = [];
-  const unseen = new Set(remaining);
-  while (unseen.size > 0) {
-    const seed = [...unseen].sort()[0];
-    const component = new Set<string>();
-    const frontier = [seed];
-    while (frontier.length > 0) {
-      const name = frontier.pop()!;
-      if (!unseen.delete(name)) continue;
-      component.add(name);
-      const neighbors = [...incoming.get(name)!, ...outgoing.get(name)!];
-      for (const neighbor of neighbors) {
-        if (unseen.has(neighbor)) frontier.push(neighbor);
+
+  const strongConnect = (v: string): void => {
+    indices.set(v, nextIndex);
+    lowlinks.set(v, nextIndex);
+    nextIndex += 1;
+    tarjanStack.push(v);
+    onStack.add(v);
+
+    for (const w of adjacency.get(v) ?? []) {
+      // 仅门节点参与环搜索；缺失引用对应的目标不在邻接表中。
+      if (!adjacency.has(w)) continue;
+      if (!indices.has(w)) {
+        strongConnect(w);
+        lowlinks.set(v, Math.min(lowlinks.get(v)!, lowlinks.get(w)!));
+      } else if (onStack.has(w)) {
+        lowlinks.set(v, Math.min(lowlinks.get(v)!, indices.get(w)!));
       }
     }
-    components.push(component);
+
+    if (lowlinks.get(v) === indices.get(v)) {
+      const component = new Set<string>();
+      let w: string;
+      do {
+        w = tarjanStack.pop()!;
+        onStack.delete(w);
+        component.add(w);
+      } while (w !== v);
+      // 多节点 SCC 必含有向环；单节点仅在存在自环时成环
+      // （validate 流程中自环由 self_reference 另行报告，不进入邻接表）。
+      if (component.size > 1 || adjacency.get(v)!.includes(v)) {
+        components.push(component);
+      }
+    }
+  };
+
+  for (const v of adjacency.keys()) {
+    if (!indices.has(v)) strongConnect(v);
   }
 
   return components
@@ -142,17 +141,50 @@ export function findCycles(adjacency: Map<string, string[]>): string[][] {
     .sort((a, b) => a.join('~').localeCompare(b.join('~')));
 }
 
-/** 在一个非平凡 SCC 的受限子图中走出一条具体环。 */
+/**
+ * 在一个非平凡 SCC 的受限子图中找一条经过字典序最小节点、由真实边
+ * 组成且闭合的具体环。SCC 保证该节点必在某条环上；用 BFS 求回到起点
+ * 的最短路径（邻居按字典序展开，结果确定且与门定义顺序无关）。
+ */
 function cycleInComponent(nodes: Set<string>, adjacency: Map<string, string[]>): string[] {
   const start = [...nodes].sort()[0];
-  const path: string[] = [];
-  const pos = new Map<string, number>();
-  let current = start;
+  if (nodes.size === 1) return [start];
 
-  while (!pos.has(current)) {
-    pos.set(current, path.length);
-    path.push(current);
-    current = adjacency.get(current)!.filter((n) => nodes.has(n)).sort()[0];
+  const predecessor = new Map<string, string>();
+  const frontier: string[] = [];
+  // 初始化起点的一层后继（排除起点自身的自环），保证环长度 ≥ 2。
+  for (const w of (adjacency.get(start) ?? []).filter((n) => nodes.has(n) && n !== start).sort()) {
+    if (!predecessor.has(w)) {
+      predecessor.set(w, start);
+      frontier.push(w);
+    }
   }
-  return path.slice(pos.get(current)!);
+
+  let cursor = 0;
+  while (cursor < frontier.length) {
+    const v = frontier[cursor];
+    cursor += 1;
+    const neighbors = (adjacency.get(v) ?? []).filter((n) => nodes.has(n)).sort();
+    if (neighbors.includes(start)) {
+      // 回到起点的闭合边已确认；返回不含重复起点的节点序列，
+      // 由调用方在消息中补 “→ 起点” 形成闭合见证。
+      const path = [start];
+      const reversed: string[] = [v];
+      let node = v;
+      while (node !== start) {
+        node = predecessor.get(node)!;
+        if (node !== start) reversed.push(node);
+      }
+      path.push(...reversed.reverse());
+      return path;
+    }
+    for (const w of neighbors) {
+      if (!predecessor.has(w)) {
+        predecessor.set(w, v);
+        frontier.push(w);
+      }
+    }
+  }
+  // 非平凡 SCC 数学上必含回到起点的环，不可达仅可能是构图错误。
+  return [start];
 }

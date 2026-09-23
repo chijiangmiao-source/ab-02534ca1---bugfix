@@ -9,7 +9,7 @@ npm test -- --run
 echo '== [2/4] 构建检查（tsc + vite build） =='
 npm run build
 
-echo '== [3/4] 规定场景断言：吸收律 / 共享子门归属 / complexity_limit =='
+echo '== [3/4] 规定场景断言：吸收律 / 共享子门归属 / complexity_limit / 双环定位 =='
 mkdir -p .verify
 npx esbuild scripts/verify-scenarios.ts \
   --bundle --platform=node --format=esm --outfile=.verify/scenarios.mjs

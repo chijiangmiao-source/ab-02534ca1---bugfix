@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { analyze, MAX_CUTSETS_PER_GATE } from './engine';
 import { parseEvents, parseGates, parseModel, parseTop } from './parser';
 import { audit } from './pipeline';
-import type { ParsedModel } from './types';
+import type { Issue, ParsedModel } from './types';
 import { findCycles, validate } from './validate';
 
 function model(events: string[], lines: string[], top: string): ParsedModel {
@@ -14,6 +14,27 @@ function model(events: string[], lines: string[], top: string): ParsedModel {
 }
 
 const ids = (cuts: string[][]): string[] => cuts.map((c) => c.join('·'));
+
+/** 从 cycle 问题消息中提取见证序列（消息格式：…：A → B → A（…））。 */
+function cycleWitness(message: string): string[] {
+  const body = message.split('：')[1]!.split('（')[0]!.trim();
+  return body.split(' → ').map((s) => s.trim());
+}
+
+/** 校验一条环见证：节点互不相同（除首尾相同），且每步都是真实引用。 */
+function expectClosedWitness(m: ParsedModel, issue: Issue): string[] {
+  const path = cycleWitness(issue.message);
+  expect(path.length).toBeGreaterThanOrEqual(3);
+  expect(path[0]).toBe(path[path.length - 1]);
+  expect(path[0]).toBe(issue.location.token);
+  expect(new Set(path.slice(0, -1)).size).toBe(path.length - 1);
+  for (let i = 0; i < path.length - 1; i += 1) {
+    const gate = m.gates.find((g) => g.name === path[i]);
+    expect(gate, `门 ${path[i]} 应存在`).toBeDefined();
+    expect(gate!.inputs).toContain(path[i + 1]);
+  }
+  return path;
+}
 
 describe('parse', () => {
   it('接受注释、空行并保留非法行', () => {
@@ -86,8 +107,110 @@ describe('validate', () => {
     expect(issues.find((i) => i.code === 'cycle')!.message).toContain('→');
   });
 
+  it('单个任意长度环（5 环）只报一条且见证沿真实边闭合', () => {
+    const lines = ['G0 OR G1', 'G1 OR G2', 'G2 OR G3', 'G3 OR G4', 'G4 OR G0'];
+    const m = model(['X'], lines, 'G0');
+    const cycles = validate(m).filter((i) => i.code === 'cycle');
+    expect(cycles).toHaveLength(1);
+    const path = cycleWitness(cycles[0].message);
+    expect(path).toHaveLength(6); // 5 个不同节点 + 回到起点
+    expect(path[0]).toBe('G0');
+    expect(path[path.length - 1]).toBe('G0');
+    expect(new Set(path.slice(0, -1)).size).toBe(5);
+    for (let i = 0; i < path.length - 1; i += 1) {
+      expect(m.gates.find((g) => g.name === path[i])!.inputs).toContain(path[i + 1]);
+    }
+    expect(cycles[0].location).toMatchObject({ area: 'gates', line: 1, token: 'G0' });
+  });
+
   it('共享 DAG（菱形）合法', () => {
     expect(validate(model(['A', 'B'], ['S OR A B', 'L AND S A', 'R AND S B', 'T OR L R'], 'T'))).toHaveLength(0);
+  });
+});
+
+describe('双环审计', () => {
+  const EVENTS = 'PWR_A\nPWR_B\n';
+  const GATES =
+    'A1 OR PWR_A A2\n' +
+    'A2 AND A1 B1\n' +
+    'B1 OR PWR_A B2\n' +
+    'B2 AND B1 PWR_B\n';
+
+  it('一次审计报告两个相互独立的环：数量、闭合见证、行号全部核对', () => {
+    const parsed = parseModel(EVENTS, GATES, 'A1');
+    const r = audit(EVENTS, GATES, 'A1');
+    expect(r.status).toBe('invalid');
+    if (r.status !== 'invalid') return;
+    // 非法模型不得提前求解
+    expect('cutsets' in r).toBe(false);
+
+    const cycles = r.issues.filter((i) => i.code === 'cycle');
+    expect(cycles).toHaveLength(2);
+    // 按行号排序：上游环定位第 1 行，下游环定位第 3 行
+    expect(cycles.map((i) => i.location.line)).toEqual([1, 3]);
+    expect(cycles.map((i) => i.location.token)).toEqual(['A1', 'B1']);
+
+    expectClosedWitness(parsed.model, cycles[0]);
+    expectClosedWitness(parsed.model, cycles[1]);
+    expect(cycleWitness(cycles[0].message)).toEqual(['A1', 'A2', 'A1']);
+    expect(cycleWitness(cycles[1].message)).toEqual(['B1', 'B2', 'B1']);
+  });
+
+  it('门定义换序（下游环在前）后两个闭环都不遗漏，行号随定义位置更新', () => {
+    const reordered =
+      'B2 AND B1 PWR_B\n' +
+      'B1 OR PWR_A B2\n' +
+      'A2 AND A1 B1\n' +
+      'A1 OR PWR_A A2\n';
+    const parsed = parseModel(EVENTS, reordered, 'A1');
+    const r = audit(EVENTS, reordered, 'A1');
+    expect(r.status).toBe('invalid');
+    if (r.status !== 'invalid') return;
+
+    const cycles = r.issues.filter((i) => i.code === 'cycle');
+    expect(cycles).toHaveLength(2);
+    // 排序后仍按行号：B1 位于第 2 行，A1 位于第 4 行
+    expect(cycles.map((i) => i.location.token)).toEqual(['B1', 'A1']);
+    expect(cycles.map((i) => i.location.line)).toEqual([2, 4]);
+    for (const c of cycles) expectClosedWitness(parsed.model, c);
+    expect(cycleWitness(cycles[0].message)).toEqual(['B1', 'B2', 'B1']);
+    expect(cycleWitness(cycles[1].message)).toEqual(['A1', 'A2', 'A1']);
+  });
+
+  it('仅修复上游环时，下游环仍单独报告且模型继续保持非法', () => {
+    const fixedUpstream =
+      'A1 OR PWR_A A2\n' +
+      'A2 AND PWR_B B1\n' + // 去掉对 A1 的引用，上游环解除；A2 → B1 的单向引用保留
+      'B1 OR PWR_A B2\n' +
+      'B2 AND B1 PWR_B\n';
+    const r = audit(EVENTS, fixedUpstream, 'A1');
+    expect(r.status).toBe('invalid');
+    if (r.status !== 'invalid') return;
+
+    const cycles = r.issues.filter((i) => i.code === 'cycle');
+    expect(cycles).toHaveLength(1);
+    expect(cycles[0].location).toMatchObject({ area: 'gates', line: 3, token: 'B1' });
+    expect(cycleWitness(cycles[0].message)).toEqual(['B1', 'B2', 'B1']);
+  });
+
+  it('两个环全部修复后才允许进入割集分析', () => {
+    const fixedBoth =
+      'A1 OR PWR_A A2\n' +
+      'A2 AND PWR_B B1\n' +
+      'B1 OR PWR_A B2\n' +
+      'B2 AND PWR_A PWR_B\n';
+    const r = audit(EVENTS, fixedBoth, 'A1');
+    expect(r.status).toBe('complete');
+    if (r.status === 'complete') {
+      // B2={PWR_A∧PWR_B}，B1 取小得 {PWR_A}，A2={PWR_A∧PWR_B}，A1 吸收后只剩 {PWR_A}
+      expect(ids(r.cutsets)).toEqual(['PWR_A']);
+    }
+  });
+
+  it('共享菱形 DAG 不被误报为环并正常求解', () => {
+    const r = audit('A\nB\n', 'S OR A B\nL AND S A\nR AND S B\nT OR L R\n', 'T');
+    expect(r.status).toBe('complete');
+    if (r.status === 'complete') expect(ids(r.cutsets)).toEqual(['A', 'B']);
   });
 });
 
